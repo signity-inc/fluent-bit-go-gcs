@@ -92,9 +92,11 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	return output.FLB_OK
 }
 
-// GenerateObjectKey : gen format object name PREFIX/date/hour/tag/timestamp_uuid.log
+// GenerateObjectKey : gen format object name PREFIX/YEAR/MONTH/DAY/tag/timestamp_uuid.log
 func GenerateObjectKey(prefix, tag string, t time.Time) string {
-	fileName := fmt.Sprintf("%d_%s.log", t.Unix(), uuid.Must(uuid.NewRandom()).String())
+	year, month, day := t.Date()
+	date_str := fmt.Sprintf("%04d/%02d/%02d", year, month, day)
+	fileName := fmt.Sprintf("%s/%d_%s.log", date_str, t.Unix(), uuid.Must(uuid.NewRandom()).String())
 	return filepath.Join(prefix, tag, fileName)
 }
 
