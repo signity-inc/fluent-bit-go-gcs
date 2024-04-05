@@ -16,7 +16,7 @@ $ fluent-bit -e /path/to/built/out_gcs.so -c fluent-bit.conf
 
 # Prerequisites
 
-* Go 1.13+
+* Go 1.22.1+
 * gcc (for cgo)
 
 ## Building
