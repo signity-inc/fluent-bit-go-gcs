@@ -53,6 +53,8 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	log.Printf("[event] Flush called, context %s, %s, %v\n", values["region"], values["bucket"], C.GoString(tag))
 	dec := output.NewDecoder(data, int(length))
 
+	buffer := new(bytes.Buffer)
+
 	for {
 		ret, ts, record := output.GetRecord(dec)
 		if ret != 0 {
@@ -76,12 +78,14 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 			log.Printf("[warn] error creating message for GCS: %v\n", err)
 			continue
 		}
+		buffer.Write(line)
+		buffer.Write([]byte("\n"))
+	}
 
-		objectKey := GenerateObjectKey(values["prefix"], C.GoString(tag), timestamp)
-		if err = gcsClient.Write(values["bucket"], objectKey, bytes.NewReader(line)); err != nil {
-			log.Printf("[warn] error sending message in GCS: %v\n", err)
-			return output.FLB_RETRY
-		}
+	objectKey := GenerateObjectKey(values["prefix"], C.GoString(tag), time.Now())
+	if err = gcsClient.Write(values["bucket"], objectKey, buffer); err != nil {
+		log.Printf("[warn] error sending message in GCS: %v\n", err)
+		return output.FLB_RETRY
 	}
 
 	// Return options:
