@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	jsoniter "github.com/json-iterator/go"
 )
+import "compress/gzip"
 
 var (
 	gcsClient Client
@@ -37,9 +38,10 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 
 	// Set the context
 	output.FLBPluginSetContext(plugin, map[string]string{
-		"region": output.FLBPluginConfigKey(plugin, "Region"),
-		"bucket": output.FLBPluginConfigKey(plugin, "Bucket"),
-		"prefix": output.FLBPluginConfigKey(plugin, "Prefix"),
+		"region":  output.FLBPluginConfigKey(plugin, "Region"),
+		"bucket":  output.FLBPluginConfigKey(plugin, "Bucket"),
+		"prefix":  output.FLBPluginConfigKey(plugin, "Prefix"),
+		"jsonKey": output.FLBPluginConfigKey(plugin, "JSON_Key"),
 	})
 
 	return output.FLB_OK
@@ -53,37 +55,30 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	log.Printf("[event] Flush called, context %s, %s, %v\n", values["region"], values["bucket"], C.GoString(tag))
 	dec := output.NewDecoder(data, int(length))
 
-	buffer := new(bytes.Buffer)
+	var buffer bytes.Buffer
+	zw := gzip.NewWriter(&buffer)
 
 	for {
-		ret, ts, record := output.GetRecord(dec)
+		ret, _, record := output.GetRecord(dec)
 		if ret != 0 {
 			break
 		}
 
-		// Get timestamp
-		var timestamp time.Time
-		switch t := ts.(type) {
-		case output.FLBTime:
-			timestamp = ts.(output.FLBTime).Time
-		case uint64:
-			timestamp = time.Unix(int64(t), 0)
-		default:
-			log.Println("[warn] timestamp isn't known format. Use current time.")
-			timestamp = time.Now()
-		}
-
-		line, err := createJSON(timestamp, C.GoString(tag), record)
+		line, err := createJSON(values["jsonKey"], record)
 		if err != nil {
 			log.Printf("[warn] error creating message for GCS: %v\n", err)
 			continue
 		}
-		buffer.Write(line)
-		buffer.Write([]byte("\n"))
+		zw.Write(line)
+		zw.Write([]byte("\n"))
+	}
+
+	if err := zw.Close(); err != nil {
+		panic(err)
 	}
 
 	objectKey := GenerateObjectKey(values["prefix"], C.GoString(tag), time.Now())
-	if err = gcsClient.Write(values["bucket"], objectKey, buffer); err != nil {
+	if err = gcsClient.Write(values["bucket"], objectKey, bytes.NewReader(buffer.Bytes())); err != nil {
 		log.Printf("[warn] error sending message in GCS: %v\n", err)
 		return output.FLB_RETRY
 	}
@@ -100,7 +95,7 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 func GenerateObjectKey(prefix, tag string, t time.Time) string {
 	year, month, day := t.Date()
 	date_str := fmt.Sprintf("%04d/%02d/%02d", year, month, day)
-	fileName := fmt.Sprintf("%s/%d_%s.log", date_str, t.Unix(), uuid.Must(uuid.NewRandom()).String())
+	fileName := fmt.Sprintf("%s/%d_%s.log.gz", date_str, t.Unix(), uuid.Must(uuid.NewRandom()).String())
 	return filepath.Join(prefix, tag, fileName)
 }
 
@@ -122,10 +117,17 @@ func parseMap(mapInterface map[interface{}]interface{}) map[string]interface{} {
 	return m
 }
 
-func createJSON(timestamp time.Time, tag string, record map[interface{}]interface{}) ([]byte, error) {
+func createJSON(key string, record map[interface{}]interface{}) ([]byte, error) {
 	m := parseMap(record)
 
-	js, err := jsoniter.Marshal(m)
+	var data map[string]interface{}
+	if val, ok := m[key]; ok {
+		data = val.(map[string]interface{})
+	} else {
+		data = m
+	}
+
+	js, err := jsoniter.Marshal(data)
 	if err != nil {
 		return []byte("{}"), err
 	}
