@@ -20,3 +20,21 @@ func TestGenerateObjectKey(t *testing.T) {
 		t.Errorf("GenerateObjectKey() = %v, want %v", got, expected)
 	}
 }
+
+func TestGetCurrentJstTime(t *testing.T) {
+	now := time.Now()
+	_, offset := now.Zone()
+	jst := time.FixedZone("JST", 9*60*60)
+
+	if offset == 0 {
+		expected := now.In(jst)
+		if got := getCurrentJstTime(); !strings.Contains(fmt.Sprintf("%v", got), "JST") {
+			t.Errorf("GetCurrentJstTime() = %v, want %v", got, expected)
+		}
+	} else {
+		expected := now
+		if got := getCurrentJstTime(); !strings.Contains(fmt.Sprintf("%v", got), "JST") {
+			t.Errorf("GetCurrentJstTime() = %v, want %v", got, expected)
+		}
+	}
+}

@@ -77,7 +77,7 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 		panic(err)
 	}
 
-	objectKey := GenerateObjectKey(values["prefix"], C.GoString(tag), time.Now())
+	objectKey := GenerateObjectKey(values["prefix"], C.GoString(tag), getCurrentJstTime())
 	if err = gcsClient.Write(values["bucket"], objectKey, bytes.NewReader(buffer.Bytes())); err != nil {
 		log.Printf("[warn] error sending message in GCS: %v\n", err)
 		return output.FLB_RETRY
@@ -89,6 +89,16 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	// output.FLB_ERROR = unrecoverable error, do not try this again.
 	// output.FLB_RETRY = retry to flush later
 	return output.FLB_OK
+}
+
+func getCurrentJstTime() time.Time {
+	now := time.Now()
+	_, offset := now.Zone()
+	if offset == 0 {
+		jst := time.FixedZone("JST", 9*60*60)
+		return now.In(jst)
+	}
+	return now
 }
 
 // GenerateObjectKey : gen format object name PREFIX/YEAR/MONTH/DAY/tag/timestamp_uuid.log
