@@ -14,11 +14,24 @@ import (
 	"github.com/google/uuid"
 	jsoniter "github.com/json-iterator/go"
 )
-import "compress/gzip"
+import (
+	"compress/gzip"
+	"strconv"
+	"sync"
+)
+
+type PluginContext struct {
+	Buffer            bytes.Buffer
+	CurrentBufferSize int
+	LastFlushTime     time.Time
+	Config            map[string]string
+}
 
 var (
-	gcsClient Client
-	err       error
+	gcsClient  Client
+	err        error
+	bufferSize int
+	mutex      sync.Mutex
 )
 
 //export FLBPluginRegister
@@ -36,13 +49,25 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		return output.FLB_ERROR
 	}
 
-	// Set the context
-	output.FLBPluginSetContext(plugin, map[string]string{
+	bufferSizeStr := output.FLBPluginConfigKey(plugin, "Output_Buffer_Size")
+	bufferSize, err = strconv.Atoi(bufferSizeStr)
+	if err != nil {
+		log.Printf("[error] Invalid buffer size value: %s, error: %v\n", bufferSizeStr, err)
+		return output.FLB_ERROR
+	}
+
+	cfg := map[string]string{
 		"region":  output.FLBPluginConfigKey(plugin, "Region"),
 		"bucket":  output.FLBPluginConfigKey(plugin, "Bucket"),
 		"prefix":  output.FLBPluginConfigKey(plugin, "Prefix"),
 		"jsonKey": output.FLBPluginConfigKey(plugin, "JSON_Key"),
-	})
+	}
+
+	pluginContext := &PluginContext{
+		LastFlushTime: time.Now(),
+		Config:        cfg,
+	}
+	output.FLBPluginSetContext(plugin, pluginContext)
 
 	return output.FLB_OK
 }
@@ -50,13 +75,10 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 //export FLBPluginFlushCtx
 func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int {
 	// Type assert context back into the original type for the Go variable
-	values := output.FLBPluginGetContext(ctx).(map[string]string)
+	values := output.FLBPluginGetContext(ctx).(*PluginContext)
 
-	log.Printf("[event] Flush called, context %s, %s, %v\n", values["region"], values["bucket"], C.GoString(tag))
+	log.Printf("[event] Flush called %s, %v\n", values.Config["bucket"], C.GoString(tag))
 	dec := output.NewDecoder(data, int(length))
-
-	var buffer bytes.Buffer
-	zw := gzip.NewWriter(&buffer)
 
 	for {
 		ret, _, record := output.GetRecord(dec)
@@ -64,31 +86,69 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 			break
 		}
 
-		line, err := createJSON(values["jsonKey"], record)
+		line, err := createJSON(values.Config["jsonKey"], record)
 		if err != nil {
 			log.Printf("[warn] error creating message for GCS: %v\n", err)
 			continue
 		}
-		zw.Write(line)
-		zw.Write([]byte("\n"))
+
+		mutex.Lock()
+		values.Buffer.Write(line)
+		values.Buffer.Write([]byte("\n"))
+		values.CurrentBufferSize += len(line) + 1
+
+		if values.CurrentBufferSize >= bufferSize {
+			if err := flushBuffer(values, C.GoString(tag)); err != nil {
+				mutex.Unlock()
+				return output.FLB_RETRY
+			}
+		}
+		mutex.Unlock()
 	}
 
-	if err := zw.Close(); err != nil {
-		panic(err)
+	mutex.Lock()
+	currentTime := time.Now()
+	if currentTime.Sub(values.LastFlushTime) >= time.Minute {
+		if err := flushBuffer(values, C.GoString(tag)); err != nil {
+			mutex.Unlock()
+			return output.FLB_RETRY
+		}
 	}
-
-	objectKey := GenerateObjectKey(values["prefix"], C.GoString(tag), getCurrentJstTime())
-	if err = gcsClient.Write(values["bucket"], objectKey, bytes.NewReader(buffer.Bytes())); err != nil {
-		log.Printf("[warn] error sending message in GCS: %v\n", err)
-		return output.FLB_RETRY
-	}
-
+	mutex.Unlock()
 	// Return options:
 	//
 	// output.FLB_OK    = data have been processed.
 	// output.FLB_ERROR = unrecoverable error, do not try this again.
 	// output.FLB_RETRY = retry to flush later
 	return output.FLB_OK
+}
+
+func flushBuffer(values *PluginContext, tag string) error {
+	log.Printf("[event] Flushing buffer %s, %v\n", values.Config["bucket"], tag)
+	if values.Buffer.Len() > 0 {
+		var gzipBuffer bytes.Buffer
+		zw := gzip.NewWriter(&gzipBuffer)
+		defer zw.Close()
+
+		if _, err := zw.Write(values.Buffer.Bytes()); err != nil {
+			log.Printf("[warn] error compressing data: %v\n", err)
+			return err
+		}
+		if err := zw.Close(); err != nil {
+			log.Printf("[warn] error closing gzip writer: %v\n", err)
+			return err
+		}
+
+		objectKey := GenerateObjectKey(values.Config["prefix"], tag, getCurrentJstTime())
+		if err = gcsClient.Write(values.Config["bucket"], objectKey, &gzipBuffer); err != nil {
+			log.Printf("[warn] error sending message in GCS: %v\n", err)
+		}
+
+		values.Buffer.Reset()
+		values.CurrentBufferSize = 0
+		values.LastFlushTime = time.Now()
+	}
+	return nil
 }
 
 func getCurrentJstTime() time.Time {
