@@ -8,15 +8,7 @@ import (
 	"sync"
 )
 
-// mockData モックデータを格納する構造体
-type mockData struct {
-	writeFunc     func(bucket, object string, content io.Reader) error
-	writtenData   map[string][]byte
-	callCount     map[string]int
-	failureConfig map[string]bool
-	isMock        bool
-	mutex         sync.Mutex
-}
+// mockDataはstorage.goで定義されています
 
 // NewMockClient モッククライアントを作成します
 func NewMockClient() Client {

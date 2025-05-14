@@ -5,9 +5,20 @@ import (
 	"errors"
 	"io"
 	"io/ioutil"
+	"sync"
 
 	"cloud.google.com/go/storage"
 )
+
+// mockData モックデータを格納する構造体
+type mockData struct {
+	writeFunc     func(bucket, object string, content io.Reader) error
+	writtenData   map[string][]byte
+	callCount     map[string]int
+	failureConfig map[string]bool
+	isMock        bool
+	mutex         sync.Mutex
+}
 
 // Client & Context Google Cloud
 type Client struct {
