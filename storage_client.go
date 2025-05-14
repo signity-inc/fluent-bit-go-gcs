@@ -1,0 +1,155 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"cloud.google.com/go/storage"
+	"google.golang.org/api/option"
+)
+
+// StorageType は使用するストレージのタイプを表す型
+type StorageType string
+
+const (
+	StorageTypeGCS  StorageType = "gcs"
+	StorageTypeFile StorageType = "file"
+)
+
+// StorageClient はストレージ操作を抽象化するインターフェース
+type StorageClient interface {
+	// Write はデータをストレージに書き込む
+	Write(bucket, objectKey string, data io.Reader) error
+	// Close はストレージクライアントの接続を閉じる
+	Close() error
+}
+
+// StorageClientFactory はストレージクライアントの生成を担当する
+type StorageClientFactory struct{}
+
+// NewStorageClient は指定されたタイプのストレージクライアントを生成する
+func (f *StorageClientFactory) NewStorageClient(ctx context.Context, storageType StorageType, config map[string]string) (StorageClient, error) {
+	switch storageType {
+	case StorageTypeGCS:
+		credentialPath := config["Credential"]
+		if credentialPath == "" {
+			return nil, errors.New("GCS credential path not specified")
+		}
+		return NewGCSClient(ctx, credentialPath)
+	case StorageTypeFile:
+		outputDir := config["File_Output_Dir"]
+		if outputDir == "" {
+			return nil, errors.New("file output directory not specified")
+		}
+		return NewFileClient(outputDir)
+	default:
+		return nil, fmt.Errorf("unsupported storage type: %s", storageType)
+	}
+}
+
+// GCSClient はGoogle Cloud Storageへの操作を実装
+type GCSClient struct {
+	client *storage.Client
+	ctx    context.Context
+}
+
+// NewGCSClient は新しいGCSClientを作成する
+func NewGCSClient(ctx context.Context, credentialPath string) (*GCSClient, error) {
+	// 認証情報をファイルから直接読み込み、環境変数を使用しない
+	client, err := storage.NewClient(ctx, option.WithCredentialsFile(credentialPath))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCS client: %w", err)
+	}
+
+	return &GCSClient{
+		client: client,
+		ctx:    ctx,
+	}, nil
+}
+
+// Write はGCSバケットにデータを書き込む
+func (g *GCSClient) Write(bucket, objectKey string, data io.Reader) error {
+	wc := g.client.Bucket(bucket).Object(objectKey).NewWriter(g.ctx)
+	
+	if _, err := io.Copy(wc, data); err != nil {
+		// ライターをクローズしてエラーをラップ
+		wc.Close()
+		return fmt.Errorf("error copying data to GCS: %w", err)
+	}
+
+	if err := wc.Close(); err != nil {
+		return fmt.Errorf("error closing GCS writer: %w", err)
+	}
+
+	return nil
+}
+
+// Close はGCSクライアントを閉じる
+func (g *GCSClient) Close() error {
+	return g.client.Close()
+}
+
+// FileClient はファイルシステムへの操作を実装
+type FileClient struct {
+	outputDir string
+}
+
+// NewFileClient は新しいFileClientを作成する
+func NewFileClient(outputDir string) (*FileClient, error) {
+	// 出力ディレクトリの存在を確認し、必要なら作成
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	return &FileClient{
+		outputDir: outputDir,
+	}, nil
+}
+
+// Write はファイルシステムにデータを書き込む
+func (f *FileClient) Write(bucket, objectKey string, data io.Reader) error {
+	// バケットディレクトリを作成
+	bucketDir := filepath.Join(f.outputDir, bucket)
+	if err := os.MkdirAll(bucketDir, 0755); err != nil {
+		return fmt.Errorf("failed to create bucket directory: %w", err)
+	}
+
+	// オブジェクトキーからファイルパスを生成
+	filePath := filepath.Join(bucketDir, objectKey)
+	
+	// パストラバーサル攻撃を防止
+	cleanPath := filepath.Clean(filePath)
+	if !filepath.IsAbs(cleanPath) || !strings.HasPrefix(cleanPath, f.outputDir) {
+		return fmt.Errorf("invalid file path: path traversal attempt detected")
+	}
+	
+	// サブディレクトリの作成
+	fileDir := filepath.Dir(filePath)
+	if err := os.MkdirAll(fileDir, 0755); err != nil {
+		return fmt.Errorf("failed to create object directories: %w", err)
+	}
+
+	// ファイル作成
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	// データ書き込み
+	if _, err = io.Copy(file, data); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	return nil
+}
+
+// Close はFileClientのリソースを解放する（この実装では特に何もしない）
+func (f *FileClient) Close() error {
+	return nil
+}
