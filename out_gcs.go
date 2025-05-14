@@ -25,6 +25,9 @@ type PluginContext struct {
 	CurrentBufferSize int
 	LastFlushTime     time.Time
 	Config            map[string]string
+	// リトライ状態を管理するフィールド
+	RetryObjectKey string // リトライ時に同じオブジェクトキーを使用するための保存フィールド
+	IsRetrying     bool   // 現在リトライ中であるかどうかを示すフラグ
 }
 
 var (
@@ -77,7 +80,13 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	// Type assert context back into the original type for the Go variable
 	values := output.FLBPluginGetContext(ctx).(*PluginContext)
 
-	log.Printf("[event] Flush called %s, %v\n", values.Config["bucket"], C.GoString(tag))
+	// リトライ中であればログに記録
+	if values.IsRetrying {
+		log.Printf("[info] Retrying flush for %s with the same buffer\n", values.Config["bucket"])
+	} else {
+		log.Printf("[event] Flush called %s, %v\n", values.Config["bucket"], C.GoString(tag))
+	}
+	
 	dec := output.NewDecoder(data, int(length))
 
 	for {
@@ -93,12 +102,16 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 		}
 
 		mutex.Lock()
-		values.Buffer.Write(line)
-		values.Buffer.Write([]byte("\n"))
-		values.CurrentBufferSize += len(line) + 1
+		// リトライ中でなければ通常通りバッファに追加
+		if !values.IsRetrying {
+			values.Buffer.Write(line)
+			values.Buffer.Write([]byte("\n"))
+			values.CurrentBufferSize += len(line) + 1
+		}
 
-		if values.CurrentBufferSize >= bufferSize {
+		if values.CurrentBufferSize >= bufferSize || values.IsRetrying {
 			if err := flushBuffer(values, C.GoString(tag)); err != nil {
+				log.Printf("[info] Scheduling retry for buffer flush: %v\n", err)
 				mutex.Unlock()
 				return output.FLB_RETRY
 			}
@@ -108,13 +121,15 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 
 	mutex.Lock()
 	currentTime := time.Now()
-	if currentTime.Sub(values.LastFlushTime) >= time.Minute {
+	if values.IsRetrying || (currentTime.Sub(values.LastFlushTime) >= time.Minute && values.Buffer.Len() > 0) {
 		if err := flushBuffer(values, C.GoString(tag)); err != nil {
+			log.Printf("[info] Scheduling retry for time-based flush: %v\n", err)
 			mutex.Unlock()
 			return output.FLB_RETRY
 		}
 	}
 	mutex.Unlock()
+	
 	// Return options:
 	//
 	// output.FLB_OK    = data have been processed.
@@ -128,9 +143,10 @@ func flushBuffer(values *PluginContext, tag string) error {
 	if values.Buffer.Len() > 0 {
 		var gzipBuffer bytes.Buffer
 		zw := gzip.NewWriter(&gzipBuffer)
-		defer zw.Close()
-
+		
+		// deferは後続処理でエラーがあっても実行される保証がないため閉じる
 		if _, err := zw.Write(values.Buffer.Bytes()); err != nil {
+			zw.Close() // エラーがあってもWriterは閉じる
 			log.Printf("[warn] error compressing data: %v\n", err)
 			return err
 		}
@@ -139,14 +155,31 @@ func flushBuffer(values *PluginContext, tag string) error {
 			return err
 		}
 
-		objectKey := GenerateObjectKey(values.Config["prefix"], tag, getCurrentJstTime())
-		if err = gcsClient.Write(values.Config["bucket"], objectKey, &gzipBuffer); err != nil {
-			log.Printf("[warn] error sending message in GCS: %v\n", err)
+		// リトライ時には前回保存したオブジェクトキーを再利用し、
+		// そうでない場合は新しいキーを生成して保存する
+		var objectKey string
+		if values.IsRetrying && values.RetryObjectKey != "" {
+			objectKey = values.RetryObjectKey
+			log.Printf("[info] Retrying with the same object key: %s\n", objectKey)
+		} else {
+			objectKey = GenerateObjectKey(values.Config["prefix"], tag, getCurrentJstTime())
+			values.RetryObjectKey = objectKey // 後続のリトライのためにキーを保存
 		}
 
+		if err = gcsClient.Write(values.Config["bucket"], objectKey, &gzipBuffer); err != nil {
+			log.Printf("[warn] error sending message to GCS: %v\n", err)
+			// エラーが発生した場合、バッファをリセットせずに保持し、エラーを返す
+			// IsRetryingフラグをtrueに設定して、次回の呼び出しが再試行であることを示す
+			values.IsRetrying = true
+			return err
+		}
+
+		// 成功時のみバッファをリセットし、リトライ状態をクリアする
 		values.Buffer.Reset()
 		values.CurrentBufferSize = 0
 		values.LastFlushTime = time.Now()
+		values.IsRetrying = false
+		values.RetryObjectKey = ""
 	}
 	return nil
 }
