@@ -32,7 +32,7 @@ type PluginConfig struct {
 	JSONKey          string
 	OutputBufferSize int
 	StorageType      StorageType
-	OutputDir        string
+	OutputDir        string // File_Output_Dirパラメータから読み取った値
 	MetricsDir       string
 	MaxRetryCount    int
 	FlushInterval    time.Duration
@@ -77,9 +77,9 @@ func NewFluentBitPlugin(ctx context.Context, config *PluginConfig) (*FluentBitPl
 
 	// StorageClientの設定をマップに変換
 	storageConfig := map[string]string{
-		"credential": config.Credential,
-		"region":     config.Region,
-		"output_dir": config.OutputDir,
+		"Credential":     config.Credential,
+		"Region":         config.Region,
+		"File_Output_Dir": config.OutputDir,
 	}
 
 	// バッファ設定の作成
@@ -149,10 +149,17 @@ func (p *FluentBitPlugin) processRecord(tag string, timestamp output.FLBTime, re
 			if strValue, ok := value.(string); ok {
 				data = []byte(strValue + "\n")
 			} else {
-				data, err = convertToJSON(value)
+				// 型に関わらず、汎用的な変換処理を使用
+				// 追加ログ出力によるデバッグ
+				fmt.Printf("[debug] JSONKey value type: %T\n", value)
+				
+				// すべての型に対して汎用的な処理を行う
+				normalized := parseRecordValue(value)
+				jsonData, err := json.Marshal(normalized)
 				if err != nil {
 					return fmt.Errorf("failed to convert JSONKey value to JSON: %w", err)
 				}
+				data = append(jsonData, '\n')
 			}
 		} else {
 			return fmt.Errorf("specified JSONKey '%s' not found in record", p.config.JSONKey)
@@ -184,23 +191,54 @@ func (p *FluentBitPlugin) processRecord(tag string, timestamp output.FLBTime, re
 	return nil
 }
 
+// parseRecordValue はインターフェース値を再帰的に処理します
+func parseRecordValue(v interface{}) interface{} {
+	switch val := v.(type) {
+	case map[interface{}]interface{}:
+		return parseRecordMap(val)
+	case map[string]interface{}:
+		// 文字列キーのマップも再帰的に処理
+		m := make(map[string]interface{})
+		for k, v := range val {
+			m[k] = parseRecordValue(v)
+		}
+		return m
+	case []interface{}:
+		var array []interface{}
+		for _, item := range val {
+			array = append(array, parseRecordValue(item))
+		}
+		return array
+	default:
+		return v
+	}
+}
+
+// parseRecordMap はparseMapを拡張し、非文字列キーも処理します
+func parseRecordMap(record map[interface{}]interface{}) map[string]interface{} {
+	m := make(map[string]interface{})
+	for k, v := range record {
+		switch key := k.(type) {
+		case string:
+			m[key] = parseRecordValue(v)
+		default:
+			// 文字列でないキーは文字列に変換
+			m[fmt.Sprintf("%v", k)] = parseRecordValue(v)
+		}
+	}
+	return m
+}
+
 // convertToJSON はレコードをJSON形式に変換します
 func convertToJSON(record interface{}) ([]byte, error) {
-	// 実装はmock_client.goから移行する
 	switch t := record.(type) {
 	case []byte:
 		return append(t, '\n'), nil
 	case string:
 		return []byte(t + "\n"), nil
 	case map[interface{}]interface{}:
-		jsonMap := make(map[string]interface{})
-		for k, v := range t {
-			strKey, ok := k.(string)
-			if !ok {
-				strKey = fmt.Sprintf("%v", k)
-			}
-			jsonMap[strKey] = v
-		}
+		// 既存のparseMap関数を使用するが、より堅牢なparseRecordMapで拡張する
+		jsonMap := parseRecordMap(t)
 		jsonData, err := json.Marshal(jsonMap)
 		if err != nil {
 			return nil, err
@@ -230,7 +268,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	jsonKey := output.FLBPluginConfigKey(plugin, "JSON_Key")
 	outputBufferSizeStr := output.FLBPluginConfigKey(plugin, "Output_Buffer_Size")
 	storageTypeStr := output.FLBPluginConfigKey(plugin, "Storage_Type")
-	outputDir := output.FLBPluginConfigKey(plugin, "Output_Dir")
+	fileOutputDir := output.FLBPluginConfigKey(plugin, "File_Output_Dir")
 	metricsDir := output.FLBPluginConfigKey(plugin, "Metrics_Dir")
 	maxRetryCountStr := output.FLBPluginConfigKey(plugin, "Max_Retry_Count")
 	flushIntervalStr := output.FLBPluginConfigKey(plugin, "Flush_Interval")
@@ -283,7 +321,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		JSONKey:          jsonKey,
 		OutputBufferSize: outputBufferSize,
 		StorageType:      storageType,
-		OutputDir:        outputDir,
+		OutputDir:        fileOutputDir,
 		MetricsDir:       metricsDir,
 		MaxRetryCount:    maxRetryCount,
 		FlushInterval:    flushInterval,
