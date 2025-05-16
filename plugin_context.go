@@ -179,23 +179,16 @@ func (p *PluginContext) compressData(data []byte) (*bytes.Buffer, error) {
 	var gzipBuffer bytes.Buffer
 	zw := gzip.NewWriter(&gzipBuffer)
 	
-	// 必ずCloseを呼び出すようにする
-	defer func() {
-		if zw != nil {
-			zw.Close()
-		}
-	}()
-	
+	// データを書き込む
 	if _, err := zw.Write(data); err != nil {
+		zw.Close() // エラー時もWriterをクローズ
 		return nil, fmt.Errorf("gzip compression error: %w", err)
 	}
 	
+	// 明示的にClose呼び出し（deferではなく）
 	if err := zw.Close(); err != nil {
 		return nil, fmt.Errorf("error closing gzip writer: %w", err)
 	}
-	
-	// 明示的にnilを設定してdeferで二重クローズを防止
-	zw = nil
 	
 	return &gzipBuffer, nil
 }
