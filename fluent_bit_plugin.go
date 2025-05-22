@@ -77,8 +77,8 @@ func NewFluentBitPlugin(ctx context.Context, config *PluginConfig) (*FluentBitPl
 
 	// StorageClientの設定をマップに変換
 	storageConfig := map[string]string{
-		"Credential":     config.Credential,
-		"Region":         config.Region,
+		"Credential":      config.Credential,
+		"Region":          config.Region,
 		"File_Output_Dir": config.OutputDir,
 	}
 
@@ -149,10 +149,6 @@ func (p *FluentBitPlugin) processRecord(tag string, timestamp output.FLBTime, re
 			if strValue, ok := value.(string); ok {
 				data = []byte(strValue + "\n")
 			} else {
-				// 型に関わらず、汎用的な変換処理を使用
-				// 追加ログ出力によるデバッグ
-				fmt.Printf("[debug] JSONKey value type: %T\n", value)
-				
 				// すべての型に対して汎用的な処理を行う
 				normalized := parseRecordValue(value)
 				jsonData, err := json.Marshal(normalized)
@@ -194,6 +190,9 @@ func (p *FluentBitPlugin) processRecord(tag string, timestamp output.FLBTime, re
 // parseRecordValue はインターフェース値を再帰的に処理します
 func parseRecordValue(v interface{}) interface{} {
 	switch val := v.(type) {
+	case []byte:
+		// prevent encoding to base64
+		return string(val)
 	case map[interface{}]interface{}:
 		return parseRecordMap(val)
 	case map[string]interface{}:
