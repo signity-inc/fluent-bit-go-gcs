@@ -77,8 +77,8 @@ func NewFluentBitPlugin(ctx context.Context, config *PluginConfig) (*FluentBitPl
 
 	// StorageClientの設定をマップに変換
 	storageConfig := map[string]string{
-		"Credential":     config.Credential,
-		"Region":         config.Region,
+		"Credential":      config.Credential,
+		"Region":          config.Region,
 		"File_Output_Dir": config.OutputDir,
 	}
 
@@ -147,30 +147,30 @@ func (p *FluentBitPlugin) processRecord(tag string, timestamp output.FLBTime, re
 	if p.config.JSONKey != "" {
 		if value, ok := record[p.config.JSONKey]; ok {
 			if strValue, ok := value.(string); ok {
-				data = []byte(strValue + "\n")
+				data = []byte(strValue)
 			} else {
-				// 型に関わらず、汎用的な変換処理を使用
-				// 追加ログ出力によるデバッグ
-				fmt.Printf("[debug] JSONKey value type: %T\n", value)
-				
 				// すべての型に対して汎用的な処理を行う
 				normalized := parseRecordValue(value)
 				jsonData, err := json.Marshal(normalized)
 				if err != nil {
 					return fmt.Errorf("failed to convert JSONKey value to JSON: %w", err)
 				}
-				data = append(jsonData, '\n')
+				data = jsonData
 			}
 		} else {
 			return fmt.Errorf("specified JSONKey '%s' not found in record", p.config.JSONKey)
 		}
 	} else {
 		// JSONKeyが指定されていない場合、レコード全体をJSONに変換
-		data, err = convertToJSON(record)
+		data, err = p.convertToJSON(record)
 		if err != nil {
 			return fmt.Errorf("failed to convert record to JSON: %w", err)
 		}
 	}
+
+	// NDJSON形式のために末尾の余分な改行を削除
+	// 改行はバッファマネージャーで追加される
+	data = trimTrailingNewlines(data)
 
 	// データをバッファに追加
 	err = p.context.ProcessRecord(data, tag)
@@ -194,6 +194,9 @@ func (p *FluentBitPlugin) processRecord(tag string, timestamp output.FLBTime, re
 // parseRecordValue はインターフェース値を再帰的に処理します
 func parseRecordValue(v interface{}) interface{} {
 	switch val := v.(type) {
+	case []byte:
+		// prevent encoding to base64
+		return string(val)
 	case map[interface{}]interface{}:
 		return parseRecordMap(val)
 	case map[string]interface{}:
@@ -230,12 +233,12 @@ func parseRecordMap(record map[interface{}]interface{}) map[string]interface{} {
 }
 
 // convertToJSON はレコードをJSON形式に変換します
-func convertToJSON(record interface{}) ([]byte, error) {
+func (p *FluentBitPlugin) convertToJSON(record interface{}) ([]byte, error) {
 	switch t := record.(type) {
 	case []byte:
-		return append(t, '\n'), nil
+		return t, nil
 	case string:
-		return []byte(t + "\n"), nil
+		return []byte(t), nil
 	case map[interface{}]interface{}:
 		// 既存のparseMap関数を使用するが、より堅牢なparseRecordMapで拡張する
 		jsonMap := parseRecordMap(t)
@@ -243,14 +246,30 @@ func convertToJSON(record interface{}) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		return append(jsonData, '\n'), nil
+		return jsonData, nil
 	default:
 		jsonData, err := json.Marshal(record)
 		if err != nil {
 			return nil, err
 		}
-		return append(jsonData, '\n'), nil
+		return jsonData, nil
 	}
+}
+
+// hasTrailingNewline はデータの末尾に改行があるかをチェックします
+func hasTrailingNewline(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	return data[len(data)-1] == '\n'
+}
+
+// trimTrailingNewlines はデータの末尾のすべての改行を削除します
+func trimTrailingNewlines(data []byte) []byte {
+	for len(data) > 0 && data[len(data)-1] == '\n' {
+		data = data[:len(data)-1]
+	}
+	return data
 }
 
 //export FLBPluginRegister
@@ -404,6 +423,40 @@ func (p *FluentBitPlugin) FlushPlugin() error {
 
 	// リソースをクローズ
 	return p.context.storageClient.Close()
+}
+
+// SafeAddRecord は並行安全なレコード追加メソッド（テスト用）
+func (p *FluentBitPlugin) SafeAddRecord(record interface{}) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	
+	if p.context == nil || p.context.bufferManager == nil {
+		return fmt.Errorf("plugin context not initialized")
+	}
+	
+	recordBytes, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("marshal error: %w", err)
+	}
+	
+	return p.context.bufferManager.AddRecord(recordBytes)
+}
+
+// SafeFlushIfNeeded は並行安全なフラッシュメソッド（テスト用）
+func (p *FluentBitPlugin) SafeFlushIfNeeded() (bool, error) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	
+	if p.context == nil || p.context.bufferManager == nil {
+		return false, fmt.Errorf("plugin context not initialized")
+	}
+	
+	if p.context.bufferManager.ShouldFlush() {
+		p.context.bufferManager.Flush()
+		return true, nil
+	}
+	
+	return false, nil
 }
 
 // main関数はmain.goで定義されています
