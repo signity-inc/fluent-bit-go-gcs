@@ -76,7 +76,8 @@ func (b *BufferManager) AddRecord(record []byte) error {
 	if err != nil {
 		return err
 	}
-	// JSON行の区切りとして改行を追加
+	
+	// NDJSON形式のために改行を追加
 	_, err = b.buffer.Write([]byte("\n"))
 	if err != nil {
 		return err
