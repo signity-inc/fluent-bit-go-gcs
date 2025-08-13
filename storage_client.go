@@ -76,14 +76,27 @@ func NewGCSClient(ctx context.Context, credentialPath string) (*GCSClient, error
 func (g *GCSClient) Write(bucket, objectKey string, data io.Reader) error {
 	wc := g.client.Bucket(bucket).Object(objectKey).NewWriter(g.ctx)
 	
-	if _, err := io.Copy(wc, data); err != nil {
-		// ライターをクローズしてエラーをラップ
-		wc.Close()
-		return fmt.Errorf("error copying data to GCS: %w", err)
+	// io.Copyでエラーが発生した場合の処理
+	_, copyErr := io.Copy(wc, data)
+	
+	// wc.Closeは必ず実行する必要がある
+	// Closeしないとデータがコミットされない
+	closeErr := wc.Close()
+	
+	// エラーハンドリング: 両方のエラーを適切に処理
+	if copyErr != nil {
+		// コピーエラーが発生した場合、それを優先して返す
+		// クローズエラーもある場合はログに記録
+		if closeErr != nil {
+			// 両方のエラーがある場合は、詳細なエラーメッセージを作成
+			return fmt.Errorf("error copying data to GCS: %w (also failed to close: %v)", copyErr, closeErr)
+		}
+		return fmt.Errorf("error copying data to GCS: %w", copyErr)
 	}
-
-	if err := wc.Close(); err != nil {
-		return fmt.Errorf("error closing GCS writer: %w", err)
+	
+	// コピーは成功したがクローズに失敗した場合
+	if closeErr != nil {
+		return fmt.Errorf("error closing GCS writer: %w", closeErr)
 	}
 
 	return nil

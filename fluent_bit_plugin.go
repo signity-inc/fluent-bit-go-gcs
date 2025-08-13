@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,6 +13,20 @@ import (
 	"unsafe"
 
 	"github.com/fluent/fluent-bit-go/output"
+)
+
+// FlushResult はフラッシュ操作の結果を表す型
+type FlushResult int
+
+const (
+	// FlushResultSuccess は成功を表す
+	FlushResultSuccess FlushResult = iota
+	// FlushResultRetry はリトライ可能なエラーを表す
+	FlushResultRetry
+	// FlushResultError は永続的なエラーを表す
+	FlushResultError
+	// FlushResultNoOp は操作が不要だったことを表す
+	FlushResultNoOp
 )
 
 // FluentBitPlugin はFluent BitのGoプラグインインターフェースを実装するコンポーネントです
@@ -86,7 +101,6 @@ func NewFluentBitPlugin(ctx context.Context, config *PluginConfig) (*FluentBitPl
 	bufferConfig := BufferConfig{
 		MaxBufferSizeBytes: config.OutputBufferSize,
 		FlushTimeoutSec:    int(config.FlushInterval.Seconds()),
-		TruncateByLine:     true,
 	}
 
 	// StorageClientFactoryの作成
@@ -108,8 +122,6 @@ func NewFluentBitPlugin(ctx context.Context, config *PluginConfig) (*FluentBitPl
 	bufferManager := NewBufferManager(bufferConfig, func() {
 		metricsCollector.RecordBufferOverflow()
 	})
-	retryManager := NewRetryManager(config.MaxRetryCount, NewExponentialBackoff(
-		1*time.Second, 30*time.Second, 2.0))
 
 	// プラグインコンテキスト用の設定を作成
 	contextConfig := map[string]string{
@@ -122,7 +134,6 @@ func NewFluentBitPlugin(ctx context.Context, config *PluginConfig) (*FluentBitPl
 	pluginContext := NewPluginContext(
 		contextConfig,
 		bufferManager,
-		retryManager,
 		metricsCollector,
 		storage,
 	)
@@ -135,8 +146,8 @@ func NewFluentBitPlugin(ctx context.Context, config *PluginConfig) (*FluentBitPl
 	}, nil
 }
 
-// processRecord はFluentBitから受け取ったレコードを処理します
-func (p *FluentBitPlugin) processRecord(tag string, timestamp output.FLBTime, record map[interface{}]interface{}) error {
+// addRecordToBuffer はレコードをバッファに追加します（フラッシュは行わない）
+func (p *FluentBitPlugin) addRecordToBuffer(tag string, record map[interface{}]interface{}) error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
@@ -172,24 +183,62 @@ func (p *FluentBitPlugin) processRecord(tag string, timestamp output.FLBTime, re
 	// 改行はバッファマネージャーで追加される
 	data = trimTrailingNewlines(data)
 
-	// データをバッファに追加
-	err = p.context.ProcessRecord(data, tag)
+	// データをバッファに追加（リトライ中でも追加する）
+	err = p.context.bufferManager.AddRecord(data)
 	if err != nil {
-		return fmt.Errorf("failed to add record to buffer: %w", err)
-	}
-
-	// フラッシュ間隔またはバッファサイズの条件を満たす場合、フラッシュを実行
-	shouldFlush := time.Since(p.lastFlushTime) >= p.flushInterval || p.context.bufferManager.IsFull()
-	if shouldFlush {
-		_, err := p.context.Flush(tag)
-		if err != nil {
-			return fmt.Errorf("flush error: %w", err)
+		// バッファ満杯の場合は特別なエラーメッセージを返す
+		if strings.Contains(err.Error(), "buffer truncation") || p.context.bufferManager.IsFull() {
+			return fmt.Errorf("buffer full: %w", err)
 		}
-		p.lastFlushTime = time.Now()
+		return fmt.Errorf("failed to add record to buffer: %w", err)
 	}
 
 	return nil
 }
+
+// performFlush はバッファのフラッシュを実行し、結果を返します
+func (p *FluentBitPlugin) performFlush(tag string) (FlushResult, error) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	// バッファが空の場合は何もしない
+	if p.context.bufferManager.Size() == 0 {
+		return FlushResultNoOp, nil
+	}
+
+	// フラッシュ条件をチェック
+	shouldFlush := time.Since(p.lastFlushTime) >= p.flushInterval || 
+	               p.context.bufferManager.IsFull() ||
+	               p.context.bufferManager.ShouldFlush()
+
+	if !shouldFlush {
+		// フラッシュ条件を満たさない場合
+		return FlushResultNoOp, nil
+	}
+
+	// フラッシュを実行
+	flushResult, err := p.context.Flush(tag)
+	
+	if err != nil {
+		// エラーの種類を判定
+		if isRetryableError(err) {
+			// リトライ可能なエラー
+			return FlushResultRetry, err
+		}
+		// 永続的なエラー
+		return FlushResultError, err
+	}
+
+	// 成功時
+	p.lastFlushTime = time.Now()
+	if flushResult == 0 {
+		return FlushResultSuccess, nil
+	}
+
+	// その他のケース
+	return FlushResultNoOp, nil
+}
+
 
 // parseRecordValue はインターフェース値を再帰的に処理します
 func parseRecordValue(v interface{}) interface{} {
@@ -375,6 +424,9 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	// タグの取得
 	tagStr := C.GoString(tag)
 
+	// レコード処理中のエラーカウント
+	var processErrors int
+
 	// デコード
 	decoder := output.NewDecoder(data, int(length))
 	for {
@@ -383,18 +435,40 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 			break
 		}
 
-		// レコードを処理
-		err := flbPlugin.processRecord(tagStr, output.FLBTime{}, record)
+		// レコードを処理（フラッシュロジックなしバージョンを使用）
+		err := flbPlugin.addRecordToBuffer(tagStr, record)
 		if err != nil {
-			fmt.Printf("[error] Failed to process record: %v\n", err)
-			// エラーがあっても処理を継続
+			log.Printf("[error] Failed to add record to buffer: %v", err)
+			processErrors++
+			// バッファ満杯エラーの場合は、これ以上の処理を中断
+			if strings.Contains(err.Error(), "buffer full") {
+				break
+			}
 		}
 	}
 
-	// 明示的なフラッシュは行わず、バッファ管理に任せる
-	// タイミングにより、processRecord内のフラッシュロジックが実行されることもある
-
-	return output.FLB_OK
+	// すべてのレコードをバッファに追加した後、フラッシュを実行
+	flushResult, err := flbPlugin.performFlush(tagStr)
+	
+	// フラッシュ結果に基づいて適切な戻り値を返す
+	switch flushResult {
+	case FlushResultSuccess:
+		// 成功時はバッファをクリアしてOKを返す
+		return output.FLB_OK
+	case FlushResultRetry:
+		// リトライ可能なエラーの場合
+		log.Printf("[warn] Flush failed with retryable error: %v", err)
+		return output.FLB_RETRY
+	case FlushResultError:
+		// 永続的なエラーの場合
+		log.Printf("[error] Flush failed with permanent error: %v", err)
+		// バッファをクリアして次のデータを受け入れる準備をする
+		flbPlugin.context.bufferManager.Reset()
+		return output.FLB_ERROR
+	default:
+		// バッファが空または条件を満たさない場合はOKを返す
+		return output.FLB_OK
+	}
 }
 
 //export FLBPluginExit
