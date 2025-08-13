@@ -197,6 +197,7 @@ func (p *FluentBitPlugin) addRecordToBuffer(tag string, record map[interface{}]i
 }
 
 // performFlush はバッファのフラッシュを実行し、結果を返します
+// FLBPluginFlushCtxから呼ばれる場合は常に強制的にフラッシュします
 func (p *FluentBitPlugin) performFlush(tag string) (FlushResult, error) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
@@ -206,26 +207,19 @@ func (p *FluentBitPlugin) performFlush(tag string) (FlushResult, error) {
 		return FlushResultNoOp, nil
 	}
 
-	// フラッシュ条件をチェック
-	shouldFlush := time.Since(p.lastFlushTime) >= p.flushInterval || 
-	               p.context.bufferManager.IsFull() ||
-	               p.context.bufferManager.ShouldFlush()
-
-	if !shouldFlush {
-		// フラッシュ条件を満たさない場合
-		return FlushResultNoOp, nil
-	}
-
+	// FLBPluginFlushCtxから呼ばれる場合は常にフラッシュする
+	// （Fluent Bitがフラッシュを要求しているため）
+	
 	// フラッシュを実行
 	flushResult, err := p.context.Flush(tag)
 	
 	if err != nil {
 		// エラーの種類を判定
 		if isRetryableError(err) {
-			// リトライ可能なエラー
+			// リトライ可能なエラー（バッファは保持）
 			return FlushResultRetry, err
 		}
-		// 永続的なエラー
+		// 永続的なエラー（バッファのクリアは呼び出し元の責務）
 		return FlushResultError, err
 	}
 
@@ -440,9 +434,10 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 		if err != nil {
 			log.Printf("[error] Failed to add record to buffer: %v", err)
 			processErrors++
-			// バッファ満杯エラーの場合は、これ以上の処理を中断
-			if strings.Contains(err.Error(), "buffer full") {
-				break
+			// バッファオーバーフローエラーの場合は、これ以上の処理を中断してリトライを促す
+			if strings.Contains(err.Error(), "buffer overflow") {
+				// バッファオーバーフローの場合は即座にFLB_RETRYを返す
+				return output.FLB_RETRY
 			}
 		}
 	}

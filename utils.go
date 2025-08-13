@@ -14,6 +14,24 @@ func isRetryableError(err error) bool {
 	
 	errStr := strings.ToLower(err.Error())
 	
+	// 永続的なエラーパターン（先にチェック）
+	permanentPatterns := []string{
+		"permission",
+		"forbidden",
+		"unauthorized",
+		"invalid",
+		"not found",
+		"401",
+		"403",
+		"404",
+	}
+	
+	for _, pattern := range permanentPatterns {
+		if strings.Contains(errStr, pattern) {
+			return false
+		}
+	}
+	
 	// リトライ可能なエラーパターン
 	retryablePatterns := []string{
 		"connection",
@@ -31,24 +49,6 @@ func isRetryableError(err error) bool {
 	for _, pattern := range retryablePatterns {
 		if strings.Contains(errStr, pattern) {
 			return true
-		}
-	}
-	
-	// 永続的なエラーパターン
-	permanentPatterns := []string{
-		"permission",
-		"forbidden",
-		"unauthorized",
-		"invalid",
-		"not found",
-		"401",
-		"403",
-		"404",
-	}
-	
-	for _, pattern := range permanentPatterns {
-		if strings.Contains(errStr, pattern) {
-			return false
 		}
 	}
 	
