@@ -110,7 +110,6 @@ func TestBufferManagerConcurrentOperations(t *testing.T) {
 			config := BufferConfig{
 				MaxBufferSizeBytes: tt.bufferSize,
 				FlushTimeoutSec:    60,
-				AddTruncationMeta:  true,
 			}
 			
 			bm := NewBufferManager(config, func() {

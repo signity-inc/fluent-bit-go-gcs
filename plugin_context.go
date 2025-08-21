@@ -19,7 +19,6 @@ type PluginContext struct {
 	
 	// コンポーネント
 	bufferManager    *BufferManager
-	retryManager     *RetryManager
 	metricsCollector *MetricsCollector
 	storageClient    StorageClient
 	
@@ -31,7 +30,6 @@ type PluginContext struct {
 func NewPluginContext(
 	config map[string]string, 
 	bufferManager *BufferManager,
-	retryManager *RetryManager,
 	metricsCollector *MetricsCollector,
 	storageClient StorageClient,
 ) *PluginContext {
@@ -45,7 +43,6 @@ func NewPluginContext(
 	return &PluginContext{
 		config:           config,
 		bufferManager:    bufferManager,
-		retryManager:     retryManager,
 		metricsCollector: metricsCollector,
 		storageClient:    storageClient,
 		timezone:         jst,
@@ -54,18 +51,15 @@ func NewPluginContext(
 
 // ProcessRecord はレコードを処理してバッファに追加する
 func (p *PluginContext) ProcessRecord(record []byte, tag string) error {
-	// リトライ中でない場合のみバッファに追加
-	if !p.retryManager.IsRetrying() {
-		return p.bufferManager.AddRecord(record)
-	}
-	return nil
+	// リトライ中でもデータを受け入れる（データロスを防ぐため）
+	// 注: 以前はリトライ中はデータを破棄していたが、これはデータロスの原因となっていた
+	return p.bufferManager.AddRecord(record)
 }
 
 // FlushIfNeeded はバッファが条件を満たす場合にフラッシュを実行する
 func (p *PluginContext) FlushIfNeeded(tag string) (int, error) {
 	shouldFlush := p.bufferManager.IsFull() || 
-	               p.bufferManager.ShouldFlush() || 
-				   p.retryManager.IsRetrying()
+	               p.bufferManager.ShouldFlush()
 	
 	if shouldFlush {
 		return p.Flush(tag)
@@ -76,14 +70,9 @@ func (p *PluginContext) FlushIfNeeded(tag string) (int, error) {
 
 // Flush はバッファをフラッシュして圧縮しストレージに書き込む
 func (p *PluginContext) Flush(tag string) (int, error) {
-	// 最大リトライ回数チェック
-	if p.retryManager.GetRetryCount() > p.retryManager.maxRetryCount {
-		log.Printf("[warn] Maximum retry count (%d) reached, discarding buffer", p.retryManager.maxRetryCount)
-		p.bufferManager.Reset()
-		p.retryManager.ResetRetry()
-		p.metricsCollector.RecordMaxRetriesReached()
-		return 0, nil // エラーを返さない、バッファを破棄して続行
-	}
+	// 注: リトライ回数のチェックは削除
+	// Fluent Bitのリトライメカニズムを活用するため、
+	// プラグイン側での複雑なリトライ管理は不要
 
 	// バッファの取得
 	bufferData, err := p.bufferManager.Flush()
@@ -103,25 +92,16 @@ func (p *PluginContext) Flush(tag string) (int, error) {
 	compressedData, err := p.compressData(bufferData)
 	if err != nil {
 		log.Printf("[error] Compression error: %v", err)
-		// 圧縮エラーはリトライ対象
-		p.retryManager.IncrementRetryCount()
-		p.metricsCollector.RecordRetry()
 		p.metricsCollector.RecordError("compression")
+		// 圧縮エラーは一時的なエラーとして扱う
 		return -1, err
 	}
 
 	// 圧縮率の記録
 	p.metricsCollector.RecordCompressionRatio(len(bufferData), compressedData.Len())
 
-	// オブジェクトキーの生成または再利用
-	var objectKey string
-	if p.retryManager.IsRetrying() && p.retryManager.GetRetryObjectKey() != "" {
-		objectKey = p.retryManager.GetRetryObjectKey()
-		log.Printf("[info] Retrying with the same object key: %s", objectKey)
-	} else {
-		objectKey = p.generateObjectKey(tag)
-		p.retryManager.SetRetryObjectKey(objectKey)
-	}
+	// オブジェクトキーの生成
+	objectKey := p.generateObjectKey(tag)
 
 	// 圧縮データをストレージに書き込み
 	err = p.storageClient.Write(p.config["bucket"], objectKey, compressedData)
@@ -131,39 +111,30 @@ func (p *PluginContext) Flush(tag string) (int, error) {
 	
 	// 結果の処理
 	if err != nil {
-		// エラーログ
+		// エラータイプの判定
 		errType := "storage"
-		if strings.Contains(err.Error(), "connection") {
+		errStr := err.Error()
+		if strings.Contains(errStr, "connection") {
 			errType = "connection"
-		} else if strings.Contains(err.Error(), "timeout") {
+		} else if strings.Contains(errStr, "timeout") {
 			errType = "timeout"
-		} else if strings.Contains(err.Error(), "permission") {
+		} else if strings.Contains(errStr, "permission") || strings.Contains(errStr, "forbidden") {
 			errType = "permission"
 		}
 		
 		log.Printf("[error] Failed to write to storage: %v", err)
 		p.metricsCollector.RecordError(errType)
+		p.metricsCollector.RecordWrite(false, tag, len(bufferData), elapsed)
 		
-		// リトライ可能かチェック
-		if p.retryManager.ShouldRetry(err) {
-			p.retryManager.IncrementRetryCount()
-			p.metricsCollector.RecordRetry()
-			p.metricsCollector.RecordWrite(false, tag, len(bufferData), elapsed)
-			return -1, err // リトライを指示
-		} else {
-			// リトライ不可のエラーの場合はバッファを破棄
-			log.Printf("[warn] Non-retryable error, discarding buffer: %v", err)
-			p.bufferManager.Reset()
-			p.retryManager.ResetRetry()
-			p.metricsCollector.RecordWrite(false, tag, len(bufferData), elapsed)
-			return -1, err
-		}
+		// エラーを返す（Fluent Bitが適切にリトライを判断）
+		return -1, err
 	}
 
 	// 成功時の処理
 	log.Printf("[info] Successfully wrote data to storage: %s (%d bytes)", objectKey, compressedData.Len())
+	
+	// 成功時のみバッファをクリア
 	p.bufferManager.Reset()
-	p.retryManager.ResetRetry()
 	p.metricsCollector.RecordWrite(true, tag, len(bufferData), elapsed)
 	
 	// メトリクス出力

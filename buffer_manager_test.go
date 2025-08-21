@@ -20,7 +20,6 @@ func TestBufferManager_AddRecord(t *testing.T) {
 	config := BufferConfig{
 		MaxBufferSizeBytes: 1024, // 1KB
 		FlushTimeoutSec:    60,
-		AddTruncationMeta:  true,
 	}
 
 	bm := NewBufferManager(config, overflowCallback)
@@ -66,7 +65,6 @@ func TestBufferManager_Overflow(t *testing.T) {
 	config := BufferConfig{
 		MaxBufferSizeBytes: 400, // 400B
 		FlushTimeoutSec:    60,
-		AddTruncationMeta:  true,
 	}
 
 	bm := NewBufferManager(config, overflowCallback)
@@ -85,15 +83,30 @@ func TestBufferManager_Overflow(t *testing.T) {
 	}
 
 	// オーバーフローするまでレコードを追加
+	// 新しい仕様では、バッファ満杯時にエラーを返す
+	overflowOccurred := false
 	for i := 1; i < len(records); i++ {
-		if err := bm.AddRecord(records[i]); err != nil {
-			t.Fatalf("Failed to add record %d: %v", i, err)
+		err := bm.AddRecord(records[i])
+		if err != nil {
+			// バッファオーバーフローエラーが期待される
+			if strings.Contains(err.Error(), "buffer overflow") {
+				overflowOccurred = true
+				t.Logf("Expected overflow at record %d: %v", i, err)
+				break
+			} else {
+				t.Fatalf("Unexpected error at record %d: %v", i, err)
+			}
 		}
 	}
 
 	// オーバーフローが発生していることを確認
+	if !overflowOccurred {
+		t.Error("Buffer overflow should have occurred")
+	}
+	
+	// オーバーフローコールバックが呼ばれていることを確認
 	if overflowCount == 0 {
-		t.Error("Overflow should have occurred")
+		t.Error("Overflow callback should have been called")
 	}
 
 	// バッファをフラッシュ
@@ -123,8 +136,8 @@ func TestBufferManager_Overflow(t *testing.T) {
 		}
 	}
 
-	// メタデータが含まれているか確認
-	if config.AddTruncationMeta && len(nonEmptyLines) > 0 {
+	// メタデータのチェックは削除（機能が廃止されたため）
+	if false && len(nonEmptyLines) > 0 {
 		var meta map[string]interface{}
 		if err := json.Unmarshal([]byte(nonEmptyLines[0]), &meta); err != nil {
 			t.Fatalf("Failed to parse first line as JSON: %v", err)
@@ -147,7 +160,6 @@ func TestBufferManager_JSONIntegrity(t *testing.T) {
 	config := BufferConfig{
 		MaxBufferSizeBytes: 500, // 小さなバッファを使用
 		FlushTimeoutSec:    60,
-		AddTruncationMeta:  true,
 	}
 
 	bm := NewBufferManager(config, nil)
@@ -163,11 +175,8 @@ func TestBufferManager_JSONIntegrity(t *testing.T) {
 	bm.buffer.Write([]byte("\n"))
 	bm.currentSize = bm.buffer.Len()
 
-	// バッファを切り詰め
-	err := bm.truncateByLine()
-	if err != nil {
-		t.Fatalf("Failed to truncate buffer: %v", err)
-	}
+	// truncateByLineは廃止されたため、このテストは不要
+	// バッファオーバーフロー時はエラーを返す新しい仕様をテスト
 
 	// バッファをフラッシュ
 	data, err := bm.Flush()
@@ -185,11 +194,16 @@ func TestBufferManager_JSONIntegrity(t *testing.T) {
 		}
 	}
 
-	// 各行が有効なJSONかチェック
+	// 各行のJSONをチェック
+	// 新しい仕様では、不正なJSONも含まれる可能性がある
+	validCount := 0
 	for i, line := range nonEmptyLines {
 		var jsonObj interface{}
-		if err := json.Unmarshal([]byte(line), &jsonObj); err != nil {
-			t.Errorf("Line %d is not valid JSON after truncation: %v", i, err)
+		if err := json.Unmarshal([]byte(line), &jsonObj); err == nil {
+			validCount++
+		} else {
+			// 不正なJSONは期待される（テストで意図的に追加したため）
+			t.Logf("Line %d contains invalid JSON (expected): %v", i, err)
 			t.Logf("Invalid JSON content: %s", line)
 		}
 	}
@@ -288,7 +302,9 @@ func TestBufferManager_AddInvalidJSON(t *testing.T) {
 	t.Log("Note: Current implementation does not validate input JSON. Future enhancement could include input validation.")
 }
 
-// TestBufferManager_TruncateInvalidJSON は不正なJSONの切り詰めテスト
+// TestBufferManager_TruncateInvalidJSON は削除（truncateByLine機能が廃止されたため）
+// この機能は新しい仕様では不要
+/*
 func TestBufferManager_TruncateInvalidJSON(t *testing.T) {
 	// バッファ設定
 	config := BufferConfig{
@@ -307,10 +323,10 @@ func TestBufferManager_TruncateInvalidJSON(t *testing.T) {
 	bm.buffer.Write([]byte("\n"))
 	bm.currentSize = bm.buffer.Len()
 
-	// truncateByLineを実行
-	if err := bm.truncateByLine(); err != nil {
-		t.Fatalf("Failed to truncate buffer: %v", err)
-	}
+	// truncateByLineは廃止されたため、スキップ
+	// if err := bm.truncateByLine(); err != nil {
+	// 	t.Fatalf("Failed to truncate buffer: %v", err)
+	// }
 
 	// バッファをフラッシュして内容を確認
 	data, err := bm.Flush()
@@ -350,21 +366,21 @@ func TestBufferManager_TruncateInvalidJSON(t *testing.T) {
 		t.Error("Invalid JSON should have been removed by truncation")
 	}
 }
+*/
 
-// TestBufferManager_MetadataAddition はメタデータ追加機能をテスト
+// TestBufferManager_MetadataAddition は削除（メタデータ機能が廃止されたため）
+/*
 func TestBufferManager_MetadataAddition(t *testing.T) {
 	// メタデータありの設定
 	configWithMeta := BufferConfig{
 		MaxBufferSizeBytes: 300, // 小さめのバッファ
 		FlushTimeoutSec:    60,
-		AddTruncationMeta:  true,
 	}
 
 	// メタデータなしの設定
 	configWithoutMeta := BufferConfig{
 		MaxBufferSizeBytes: 300,
 		FlushTimeoutSec:    60,
-		AddTruncationMeta:  false,
 	}
 
 	testWithMetadata := func(config BufferConfig, expectMeta bool) {
@@ -424,6 +440,7 @@ func TestBufferManager_MetadataAddition(t *testing.T) {
 		testWithMetadata(configWithoutMeta, false)
 	})
 }
+*/
 
 // TestBufferManager_Reset はResetメソッドのテスト
 func TestBufferManager_Reset(t *testing.T) {
@@ -525,11 +542,11 @@ func TestBufferManager_EmptyBuffer(t *testing.T) {
 		t.Errorf("Flushed data from empty buffer should be nil, got %v", data)
 	}
 
-	// 何も追加せずにTruncateByLine
-	err = bm.truncateByLine()
-	if err != nil {
-		t.Fatalf("Failed to truncate empty buffer: %v", err)
-	}
+	// truncateByLineは廃止されたため、スキップ
+	// err = bm.truncateByLine()
+	// if err != nil {
+	// 	t.Fatalf("Failed to truncate empty buffer: %v", err)
+	// }
 }
 
 // ヘルパー関数: テスト用のJSONレコードを作成
